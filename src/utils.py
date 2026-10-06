@@ -1,4 +1,6 @@
 """Shared helpers: config loading, seeding, and resumable result logging."""
+from __future__ import annotations
+
 import os
 import random
 from pathlib import Path
@@ -20,16 +22,23 @@ def set_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     try:
         import torch
+
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
     except ImportError:
-        pass  # torch isn't needed until Step 5
+        pass  # torch is only needed for the BERT parts (Colab)
 
 
-def append_result(row: dict, path: str) -> None:
-    """Append one experiment row to the CSV, creating it if needed."""
+def append_result(row: dict, path: str, columns: list | None = None) -> None:
+    """Append one experiment row to a CSV, creating it (with header) if needed.
+
+    If `columns` is given, the row is written in exactly that column order and
+    missing keys become NaN, so every row in the file has the same schema.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if columns is not None:
+        row = {c: row.get(c, np.nan) for c in columns}
     pd.DataFrame([row]).to_csv(path, mode="a", header=not path.exists(), index=False)
 
 
@@ -43,5 +52,9 @@ def run_exists(path: str, **keys) -> bool:
     for k, v in keys.items():
         if k not in df.columns:
             return False
-        mask &= (df[k].astype(str) == str(v)).to_numpy()
+        col = df[k]
+        if isinstance(v, (int, float, np.number)) and not isinstance(v, bool):
+            mask &= np.isclose(pd.to_numeric(col, errors="coerce"), float(v)).astype(bool)
+        else:
+            mask &= (col.astype(str) == str(v)).to_numpy()
     return bool(mask.any())
