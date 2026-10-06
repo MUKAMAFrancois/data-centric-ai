@@ -1,0 +1,39 @@
+# Single source of truth for every experiment setting.
+seed: 42                     # fixes the train subset (same reviews in every run)
+
+data:
+  dataset_name: stanfordnlp/imdb
+  train_subset: 10000        # null = full 25k train
+  test_subset: null          # null = full 25k test (never modified)
+
+noise:
+  rates: [0.0, 0.1, 0.2, 0.3]
+  seeds: [42, 123, 2024]     # each seed = different flips + different BERT init
+
+detection:                   # cheap detector: frozen BERT embeddings + LogisticRegression
+  embed_model: bert-base-uncased
+  embed_max_length: 256
+  embed_batch_size: 64
+  cv_folds: 5
+  filter_by: prune_by_noise_rate   # Cleanlab's default confident-learning filter
+
+cleaning:
+  strategies: [remove, relabel]    # also available: hybrid
+  hybrid_threshold: 0.9            # hybrid: relabel if model prob >= this, else remove
+
+model:                       # the FIXED classifier used for every final comparison
+  name: bert-base-uncased
+  max_length: 256
+  learning_rate: 2.0e-5      # write 2.0e-5, not 2e-5: PyYAML reads 2e-5 as a string
+  epochs: 2
+  batch_size: 16
+  eval_batch_size: 64
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  fp16: true
+
+paths:
+  cache_dir: cache
+  results_file: results/experiments.csv
+  issues_dir: results/label_issues
+  figures_dir: results/figures
