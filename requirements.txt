@@ -1,8 +1,9 @@
 datasets>=2.18
 cleanlab>=2.6
-scikit-learn
+scikit-learn>=1.3
 pandas
 numpy
 matplotlib
 pyyaml
 pytest
+ipykernel

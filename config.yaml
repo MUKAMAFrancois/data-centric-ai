@@ -18,7 +18,7 @@ detection:                   # cheap detector: frozen BERT embeddings + Logistic
   filter_by: prune_by_noise_rate   # Cleanlab's default confident-learning filter
 
 cleaning:
-  strategies: [remove, relabel]    # also available: hybrid
+  strategies: [remove, relabel,hybrid]    # also available: hybrid
   hybrid_threshold: 0.9            # hybrid: relabel if model prob >= this, else remove
 
 model:                       # the FIXED classifier used for every final comparison
