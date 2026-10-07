@@ -7,6 +7,7 @@ data:
   test_subset: null          # null = full 25k test (never modified)
 
 noise:
+  types: [symmetric, instance]   # symmetric = random flips; instance = ambiguous reviews flipped more (realistic)
   rates: [0.0, 0.1, 0.2, 0.3]
   seeds: [42, 123, 2024]     # each seed = different flips + different BERT init
 
@@ -18,7 +19,7 @@ detection:                   # cheap detector: frozen BERT embeddings + Logistic
   filter_by: prune_by_noise_rate   # Cleanlab's default confident-learning filter
 
 cleaning:
-  strategies: [remove, relabel,hybrid]    # also available: hybrid
+  strategies: [remove, hybrid]     # relabel also available (weak when detection precision is ~0.5)
   hybrid_threshold: 0.9            # hybrid: relabel if model prob >= this, else remove
 
 model:                       # the FIXED classifier used for every final comparison

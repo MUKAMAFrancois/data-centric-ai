@@ -5,8 +5,13 @@ The notebook calls run_experiments(); it can also be run from the command line:
     python -m src.pipeline --mode dry-run      # local CPU check, TF-IDF stand-ins, ~2-5 min
     python -m src.pipeline --mode bert         # the real experiment (GPU: Colab/Kaggle)
 
-Runs are resumable: every finished (noise_rate, seed, dataset) is appended to the
-results CSV, and anything already there is skipped on the next call.
+Runs are resumable: every finished (noise_type, noise_rate, seed, dataset) is appended
+to the results CSV, and anything already there is skipped on the next call.
+
+Noise types (config: noise.types):
+    symmetric  labels flipped uniformly at random
+    instance   ambiguous reviews flipped far more often (like real annotator mistakes)
+At 0% noise both types are identical, so those runs are stored once with noise_type="none".
 """
 from __future__ import annotations
 
@@ -19,14 +24,14 @@ import numpy as np
 import pandas as pd
 
 from src.cleaning import find_issues, get_oof_probs, resolve_labels, save_flagged
-from src.data import inject_noise, load_imdb, profile_data, split_overlap
+from src.data import ambiguity_scores, inject_noise, load_imdb, profile_data, split_overlap
 from src.evaluate import (classification_metrics, detection_metrics, label_quality, plot_detection,
-                          plot_metric_vs_noise, recovery_table, summarize)
+                          plot_metric_vs_noise, plot_noise_type_comparison, recovery_table, summarize)
 from src.utils import append_result, load_config, run_exists, set_seed
 
 RESULT_COLUMNS = [
     # what was run
-    "noise_rate", "seed", "dataset", "strategy",
+    "noise_type", "noise_rate", "seed", "dataset", "strategy",
     # level 1: data quality
     "n_train", "n_wrong_labels", "residual_noise",
     "n_true_errors", "n_flagged", "n_flagged_correct", "det_precision", "det_recall", "det_f1",
@@ -39,9 +44,31 @@ RESULT_COLUMNS = [
 TrainFn = Callable[[pd.DataFrame, pd.DataFrame, dict, int], tuple]
 
 
-def detect(train_df: pd.DataFrame, features: np.ndarray, noise_rate: float, seed: int, det_cfg: dict):
+def migrate_results(path: str) -> None:
+    """Upgrade a results CSV written before noise types existed (adds `noise_type`).
+
+    Old rows were all symmetric noise; their 0% rows become noise_type="none".
+    """
+    path = Path(path)
+    if not path.exists():
+        return
+    df = pd.read_csv(path)
+    if "noise_type" in df.columns:
+        return
+    df.insert(0, "noise_type", np.where(df["noise_rate"] == 0, "none", "symmetric"))
+    df = df.reindex(columns=RESULT_COLUMNS)
+    df.to_csv(path, index=False)
+
+
+def issues_filename(noise_type: str, noise_rate: float, seed: int) -> str:
+    return f"{noise_type}_noise{int(round(noise_rate * 100)):02d}_seed{seed}.csv"
+
+
+def detect(train_df: pd.DataFrame, features: np.ndarray, noise_rate: float, seed: int, det_cfg: dict,
+           noise_type: str = "symmetric", difficulty: np.ndarray | None = None):
     """Inject noise, run Cleanlab on out-of-fold probabilities, score the detection."""
-    noisy = inject_noise(train_df, noise_rate, seed)
+    ntype = "symmetric" if noise_type == "none" else noise_type
+    noisy = inject_noise(train_df, noise_rate, seed, noise_type=ntype, difficulty=difficulty)
     probs = get_oof_probs(features, noisy["label"].to_numpy(), det_cfg.get("cv_folds", 5), seed)
     issues = find_issues(noisy["label"].to_numpy(), probs, det_cfg.get("filter_by", "prune_by_noise_rate"))
     det = detection_metrics(noisy["is_noisy"], issues["is_label_issue"])
@@ -58,6 +85,17 @@ def build_variants(noisy: pd.DataFrame, issues: pd.DataFrame, noise_rate: float,
     return variants
 
 
+def plan_jobs(noise_cfg: dict) -> list[tuple[str, float, int]]:
+    """All (noise_type, noise_rate, seed) combinations; 0% noise appears once as 'none'."""
+    types = noise_cfg.get("types", ["symmetric"])
+    jobs = []
+    for rate in noise_cfg["rates"]:
+        for ntype in (["none"] if rate == 0 else types):
+            for seed in noise_cfg["seeds"]:
+                jobs.append((ntype, rate, seed))
+    return jobs
+
+
 def run_experiments(
     cfg: dict,
     train_df: pd.DataFrame,
@@ -68,56 +106,65 @@ def run_experiments(
     issues_dir: str | None = None,
     log: Callable[[str], None] = print,
 ) -> pd.DataFrame:
-    """Run every (noise_rate, seed, dataset) combination that isn't logged yet."""
+    """Run every (noise_type, noise_rate, seed, dataset) combination that isn't logged yet."""
     assert len(features) == len(train_df), "features must be row-aligned with train_df"
     assert "true_label" not in test_df.columns, "the test set must never be noised"
     test_labels_before = test_df["label"].to_numpy().copy()
     strategies = cfg["cleaning"].get("strategies", [])
+    migrate_results(results_file)
 
-    for rate in cfg["noise"]["rates"]:
-        for seed in cfg["noise"]["seeds"]:
-            names = ["clean" if rate == 0 else "noisy"] + [f"cleaned_{s}" for s in strategies]
-            if all(run_exists(results_file, noise_rate=rate, seed=seed, dataset=n) for n in names):
-                log(f"[skip] noise={rate:.0%} seed={seed}: already done")
+    jobs = plan_jobs(cfg["noise"])
+    difficulty = None
+    if any(ntype == "instance" for ntype, _, _ in jobs):
+        log("[noise] scoring review ambiguity for instance-dependent noise ...")
+        difficulty = ambiguity_scores(train_df["text"], train_df["label"], seed=cfg.get("seed", 42))
+
+    for ntype, rate, seed in jobs:
+        names = ["clean" if rate == 0 else "noisy"] + [f"cleaned_{s}" for s in strategies]
+        keys = {"noise_type": ntype, "noise_rate": rate, "seed": seed}
+        if all(run_exists(results_file, **keys, dataset=n) for n in names):
+            log(f"[skip] {ntype} noise={rate:.0%} seed={seed}: already done")
+            continue
+
+        set_seed(seed)
+        noisy, issues, det = detect(train_df, features, rate, seed, cfg["detection"], ntype, difficulty)
+        log(f"[detect] {ntype} noise={rate:.0%} seed={seed}: flagged {det['n_flagged']} "
+            f"(true errors {det['n_true_errors']}, precision {det['det_precision']}, recall {det['det_recall']})")
+        if issues_dir:
+            save_flagged(noisy, issues, f"{issues_dir}/{issues_filename(ntype, rate, seed)}")
+
+        for name, (df, extra) in build_variants(noisy, issues, rate, cfg["cleaning"]).items():
+            if run_exists(results_file, **keys, dataset=name):
                 continue
-
-            set_seed(seed)
-            noisy, issues, det = detect(train_df, features, rate, seed, cfg["detection"])
-            log(f"[detect] noise={rate:.0%} seed={seed}: flagged {det['n_flagged']} "
-                f"(true errors {det['n_true_errors']}, precision {det['det_precision']}, recall {det['det_recall']})")
-            if issues_dir:
-                save_flagged(noisy, issues, f"{issues_dir}/noise{int(rate * 100):02d}_seed{seed}.csv")
-
-            for name, (df, extra) in build_variants(noisy, issues, rate, cfg["cleaning"]).items():
-                if run_exists(results_file, noise_rate=rate, seed=seed, dataset=name):
-                    continue
-                t0 = time.time()
-                y_pred, y_prob = train_fn(df, test_df, cfg["model"], seed)
-                row = {"noise_rate": rate, "seed": seed, "dataset": name, **extra, **det,
-                       **label_quality(df), **classification_metrics(test_df["label"], y_pred, y_prob),
-                       "train_seconds": round(time.time() - t0, 1)}
-                append_result(row, results_file, RESULT_COLUMNS)
-                log(f"   [train] {name:<16} n={len(df):>6}  residual_noise={row['residual_noise']:.3f}  "
-                    f"acc={row['accuracy']:.4f}  f1={row['f1']:.4f}  ({row['train_seconds']}s)")
+            t0 = time.time()
+            y_pred, y_prob = train_fn(df, test_df, cfg["model"], seed)
+            row = {**keys, "dataset": name, **extra, **det,
+                   **label_quality(df), **classification_metrics(test_df["label"], y_pred, y_prob),
+                   "train_seconds": round(time.time() - t0, 1)}
+            append_result(row, results_file, RESULT_COLUMNS)
+            log(f"   [train] {name:<16} n={len(df):>6}  residual_noise={row['residual_noise']:.3f}  "
+                f"acc={row['accuracy']:.4f}  f1={row['f1']:.4f}  ({row['train_seconds']}s)")
 
     assert np.array_equal(test_df["label"].to_numpy(), test_labels_before), "test labels changed!"
     return pd.read_csv(results_file)
 
 
 def report(results: pd.DataFrame, figures_dir: str | None = None) -> None:
-    """Print the summary tables and save the two main figures."""
+    """Print the summary tables and save the main figures."""
     pd.set_option("display.width", 160)
     print("\n=== Model quality (mean ± std over seeds) ===")
     print(summarize(results, metrics=("accuracy", "f1")).to_string(index=False))
     print("\n=== Recovery of F1 lost to noise ===")
     print(recovery_table(results, "f1").to_string(index=False))
     print("\n=== Detection quality vs. known corrupted labels ===")
-    det = results[results.noise_rate > 0].drop_duplicates(["noise_rate", "seed"])
-    print(det.groupby("noise_rate")[["n_true_errors", "n_flagged", "det_precision", "det_recall", "det_f1"]]
-          .mean().round(3).to_string())
+    det = results[results.noise_rate > 0].drop_duplicates(["noise_type", "noise_rate", "seed"])
+    print(det.groupby(["noise_type", "noise_rate"])[["n_true_errors", "n_flagged", "det_precision",
+                                                     "det_recall", "det_f1"]].mean().round(3).to_string())
     if figures_dir:
-        plot_metric_vs_noise(results, "f1", f"{figures_dir}/f1_vs_noise.png")
+        for ntype in sorted(set(results.noise_type) - {"none"}):
+            plot_metric_vs_noise(results, "f1", f"{figures_dir}/f1_vs_noise_{ntype}.png", noise_type=ntype)
         plot_detection(results, f"{figures_dir}/detection_vs_noise.png")
+        plot_noise_type_comparison(results, "f1", f"{figures_dir}/noise_type_comparison.png")
         print(f"\nFigures saved to {figures_dir}/")
 
 

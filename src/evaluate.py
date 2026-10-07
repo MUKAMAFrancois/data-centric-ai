@@ -101,8 +101,17 @@ def recovery_rate(clean: float, noisy: float, cleaned: float) -> float:
 #  #
 # Summaries
 #  #
-def summarize(results: pd.DataFrame, metrics=("accuracy", "f1"), by=("noise_rate", "dataset")) -> pd.DataFrame:
+def with_noise_type(results: pd.DataFrame) -> pd.DataFrame:
+    """Results written before noise types existed were all symmetric (0% rows = 'none')."""
+    if "noise_type" in results.columns:
+        return results
+    return results.assign(noise_type=np.where(results["noise_rate"] == 0, "none", "symmetric"))
+
+
+def summarize(results: pd.DataFrame, metrics=("accuracy", "f1"),
+              by=("noise_type", "noise_rate", "dataset")) -> pd.DataFrame:
     """Mean ± std over seeds, as a readable table."""
+    results = with_noise_type(results)
     g = results.groupby(list(by))[list(metrics)].agg(["mean", "std"])
     table = pd.DataFrame(index=g.index)
     for m in metrics:
@@ -112,24 +121,27 @@ def summarize(results: pd.DataFrame, metrics=("accuracy", "f1"), by=("noise_rate
 
 
 def recovery_table(results: pd.DataFrame, metric: str = "f1") -> pd.DataFrame:
-    """Recovery rate per noise level and cleaning strategy (seed-averaged)."""
-    mean = results.groupby(["noise_rate", "dataset"])[metric].mean().unstack()
-    if "clean" not in mean.columns:
+    """Recovery rate per noise type, noise level and cleaning strategy (seed-averaged)."""
+    r = with_noise_type(results)
+    clean = r[(r["noise_rate"] == 0) & (r["dataset"] == "clean")][metric]
+    if clean.empty:
         return pd.DataFrame()
-    clean = mean["clean"].dropna()
-    clean_ref = clean.iloc[0] if len(clean) else np.nan  # clean = the 0% noise run
+    clean_ref = clean.mean()
+    mean = r[r["noise_rate"] > 0].groupby(["noise_type", "noise_rate", "dataset"])[metric].mean()
     rows = []
-    for rate, row in mean.iterrows():
-        if rate == 0 or "noisy" not in row or pd.isna(row.get("noisy")):
+    for (ntype, rate), grp in mean.groupby(level=[0, 1]):
+        g = grp.droplevel([0, 1])
+        if "noisy" not in g.index:
             continue
-        for col in [c for c in mean.columns if c.startswith("cleaned_")]:
+        for col in [c for c in g.index if c.startswith("cleaned_")]:
             rows.append({
+                "noise_type": ntype,
                 "noise_rate": rate,
                 "strategy": col.replace("cleaned_", ""),
                 f"clean_{metric}": round(clean_ref, 4),
-                f"noisy_{metric}": round(row["noisy"], 4),
-                f"cleaned_{metric}": round(row[col], 4),
-                "recovery_rate": recovery_rate(clean_ref, row["noisy"], row[col]),
+                f"noisy_{metric}": round(g["noisy"], 4),
+                f"cleaned_{metric}": round(g[col], 4),
+                "recovery_rate": recovery_rate(clean_ref, g["noisy"], g[col]),
             })
     return pd.DataFrame(rows)
 
@@ -137,6 +149,10 @@ def recovery_table(results: pd.DataFrame, metric: str = "f1") -> pd.DataFrame:
 #  #
 # Figures
 #  #
+NOISE_TYPE_COLORS = {"symmetric": "#2a78d6", "instance": "#eb6834"}  # blue, orange
+NOISE_TYPE_LABELS = {"symmetric": "Random (symmetric) noise", "instance": "Realistic (instance-dependent) noise"}
+
+
 def _style_axes(ax):
     for side in ("top", "right"):
         ax.spines[side].set_visible(False)
@@ -147,19 +163,37 @@ def _style_axes(ax):
     ax.set_axisbelow(True)
 
 
-def plot_metric_vs_noise(results: pd.DataFrame, metric: str = "f1", path: str | None = None):
-    """Line per dataset variant: metric vs. noise rate, mean ± std over seeds."""
+def _metric_name(metric: str) -> str:
+    return metric.upper() if len(metric) <= 3 else metric.replace("_", " ")
+
+
+def _clean_reference(ax, r: pd.DataFrame, metric: str) -> None:
+    clean = r[(r["noise_rate"] == 0) & (r["dataset"] == "clean")][metric]
+    if len(clean):
+        y = clean.mean()
+        ax.axhline(y, color="#52514e", linewidth=1.2, linestyle="--", zorder=1)
+        ax.text(0.995, y, "Clean data (upper bound)  ", transform=ax.get_yaxis_transform(),
+                ha="right", va="bottom", fontsize=8.5, color="#52514e")
+
+
+def _save(fig, path):
+    fig.tight_layout()
+    if path:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, bbox_inches="tight")
+    return fig
+
+
+def plot_metric_vs_noise(results: pd.DataFrame, metric: str = "f1", path: str | None = None,
+                         noise_type: str = "symmetric"):
+    """Line per dataset variant for ONE noise type: metric vs. noise rate, mean ± std over seeds."""
     import matplotlib.pyplot as plt
 
-    stats = results.groupby(["dataset", "noise_rate"])[metric].agg(["mean", "std"]).reset_index()
+    r = with_noise_type(results)
+    sub = r[r["noise_type"].isin([noise_type, "none"])]
+    stats = sub.groupby(["dataset", "noise_rate"])[metric].agg(["mean", "std"]).reset_index()
     fig, ax = plt.subplots(figsize=(7, 4.2), dpi=150)
-
-    clean = stats[stats.dataset == "clean"]
-    if len(clean):  # the clean model is a reference line, not a series over noise
-        y = clean["mean"].iloc[0]
-        ax.axhline(y, color=DATASET_COLORS["clean"], linewidth=1.5, linestyle="--", zorder=1)
-        ax.text(0.995, y, f"  {DATASET_LABELS['clean']}", transform=ax.get_yaxis_transform(),
-                ha="right", va="bottom", fontsize=8.5, color="#52514e")
+    _clean_reference(ax, r, metric)
 
     for name in [d for d in DATASET_LABELS if d != "clean" and d in set(stats.dataset)]:
         s = stats[stats.dataset == name].sort_values("noise_rate")
@@ -169,48 +203,68 @@ def plot_metric_vs_noise(results: pd.DataFrame, metric: str = "f1", path: str | 
         ax.fill_between(x, s["mean"] - s["std"].fillna(0), s["mean"] + s["std"].fillna(0),
                         color=DATASET_COLORS[name], alpha=0.15, linewidth=0, zorder=2)
 
-    name = metric.upper() if len(metric) <= 3 else metric.replace("_", " ")
-    ax.set_xticks(sorted(results["noise_rate"].unique() * 100))
+    name = _metric_name(metric)
+    ax.set_xticks(sorted(sub["noise_rate"].unique() * 100))
     ax.set_xlabel("Injected label noise (%)", color="#52514e")
     ax.set_ylabel(f"Test {name}", color="#52514e")
-    ax.set_title(f"Same model, different data quality: test {name} vs. label noise",
+    ax.set_title(f"Same model, different data quality: test {name}\n{NOISE_TYPE_LABELS.get(noise_type, noise_type)}",
                  loc="left", fontsize=11, color="#0b0b0b")
     _style_axes(ax)
     ax.legend(frameon=False, fontsize=9, loc="lower left")
-    fig.tight_layout()
-    if path:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, bbox_inches="tight")
-    return fig
+    return _save(fig, path)
+
+
+def plot_noise_type_comparison(results: pd.DataFrame, metric: str = "f1", path: str | None = None):
+    """Which noise hurts more? Noisy-model metric vs. noise rate, one line per noise type."""
+    import matplotlib.pyplot as plt
+
+    r = with_noise_type(results)
+    noisy = r[(r["dataset"] == "noisy")]
+    fig, ax = plt.subplots(figsize=(7, 4.2), dpi=150)
+    _clean_reference(ax, r, metric)
+    for ntype in [t for t in NOISE_TYPE_COLORS if t in set(noisy.noise_type)]:
+        s = noisy[noisy.noise_type == ntype].groupby("noise_rate")[metric].agg(["mean", "std"])
+        x = s.index.to_numpy() * 100
+        ax.plot(x, s["mean"], color=NOISE_TYPE_COLORS[ntype], linewidth=2, marker="o", markersize=6,
+                markeredgecolor="white", markeredgewidth=1.5, label=NOISE_TYPE_LABELS[ntype], zorder=3)
+        ax.fill_between(x, s["mean"] - s["std"].fillna(0), s["mean"] + s["std"].fillna(0),
+                        color=NOISE_TYPE_COLORS[ntype], alpha=0.15, linewidth=0, zorder=2)
+    name = _metric_name(metric)
+    if len(noisy):
+        ax.set_xticks(sorted(noisy["noise_rate"].unique() * 100))
+    ax.set_xlabel("Injected label noise (%)", color="#52514e")
+    ax.set_ylabel(f"Test {name} (trained on noisy labels)", color="#52514e")
+    ax.set_title(f"Which label noise hurts BERT more? (test {name})", loc="left", fontsize=11, color="#0b0b0b")
+    _style_axes(ax)
+    ax.legend(frameon=False, fontsize=9, loc="lower left")
+    return _save(fig, path)
 
 
 def plot_detection(results: pd.DataFrame, path: str | None = None):
-    """Cleanlab detection precision and recall vs. noise rate (one row per noise/seed)."""
+    """Cleanlab detection precision (solid) and recall (dashed) vs. noise rate, per noise type."""
     import matplotlib.pyplot as plt
 
-    det = (results[results.noise_rate > 0]
-           .drop_duplicates(["noise_rate", "seed"])
-           .groupby("noise_rate")[["det_precision", "det_recall"]].agg(["mean", "std"]))
+    r = with_noise_type(results)
+    det = (r[r["noise_rate"] > 0]
+           .drop_duplicates(["noise_type", "noise_rate", "seed"])
+           .groupby(["noise_type", "noise_rate"])[["det_precision", "det_recall"]].agg(["mean", "std"]))
     fig, ax = plt.subplots(figsize=(7, 4.2), dpi=150)
-    x = det.index.to_numpy() * 100
-    for col, color, label in [("det_precision", "#2a78d6", "Detection precision"),
-                              ("det_recall", "#eb6834", "Detection recall")]:
-        mu, sd = det[(col, "mean")], det[(col, "std")].fillna(0)
-        ax.plot(x, mu, color=color, linewidth=2, marker="o", markersize=6,
-                markeredgecolor="white", markeredgewidth=1.5, label=label, zorder=3)
-        ax.fill_between(x, mu - sd, mu + sd, color=color, alpha=0.15, linewidth=0)
+    for ntype in [t for t in NOISE_TYPE_COLORS if t in det.index.get_level_values(0)]:
+        d = det.loc[ntype]
+        x = d.index.to_numpy() * 100
+        for col, style, label in [("det_precision", "-", "precision"), ("det_recall", "--", "recall")]:
+            mu, sd = d[(col, "mean")], d[(col, "std")].fillna(0)
+            ax.plot(x, mu, color=NOISE_TYPE_COLORS[ntype], linewidth=2, linestyle=style, marker="o", markersize=6,
+                    markeredgecolor="white", markeredgewidth=1.5, label=f"{ntype}: {label}", zorder=3)
+            ax.fill_between(x, mu - sd, mu + sd, color=NOISE_TYPE_COLORS[ntype], alpha=0.12, linewidth=0)
+        ax.set_xticks(x)
     ax.set_ylim(0, 1.02)
-    ax.set_xticks(x)
     ax.set_xlabel("Injected label noise (%)", color="#52514e")
     ax.set_ylabel("Score vs. known corrupted labels", color="#52514e")
     ax.set_title("How well Cleanlab finds the labels we corrupted", loc="left", fontsize=11, color="#0b0b0b")
     _style_axes(ax)
-    ax.legend(frameon=False, fontsize=9, loc="lower left")
-    fig.tight_layout()
-    if path:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, bbox_inches="tight")
-    return fig
+    ax.legend(frameon=False, fontsize=9, loc="lower left", ncol=2, handlelength=3.5)
+    return _save(fig, path)
 
 
 def plot_confusion(row: pd.Series | dict, title: str = "", path: str | None = None):
