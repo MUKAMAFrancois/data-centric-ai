@@ -148,7 +148,7 @@ Data profiling also found **19** duplicate reviews in the training subset, **201
 
 ## 4. Discussion
 
-**Why random noise barely hurts.** A likely explanation: a pretrained model fine-tuned for only 2 epochs
+**Why random noise barely hurts.** a pretrained model fine-tuned for only 2 epochs
 learns the dominant pattern before it has time to memorize randomly flipped labels. Random errors also tend to sit on easy,
 clear-cut reviews, where the model's prior knowledge outweighs the wrong label.
 
@@ -163,7 +163,7 @@ decision boundary. Those are exactly the examples the model needs to learn where
 - Recall was 0.63–0.78, so **6–9% wrong labels remained** after cleaning.
 - Since BERT tolerates noise well, the gain from cleaner labels was smaller than the loss from less, and easier, data.
 
-**Takeaway for practitioners:** label-error detection is a good way to **prioritize human review**.
+The label-error detection is a good way to **prioritize human review**.
 Blindly deleting flagged examples can hurt a strong pretrained model, so detection precision
 should be checked before acting on its flags automatically.
 
